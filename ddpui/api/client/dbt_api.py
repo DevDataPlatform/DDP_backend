@@ -1,53 +1,54 @@
 import os
 from pathlib import Path
+from redis import Redis
+from uuid import uuid4
 
 from ninja import NinjaAPI
 from ninja.errors import HttpError
 
-# from ninja.errors import ValidationError
-# from ninja.responses import Response
-# from pydantic.error_wrappers import ValidationError as PydanticValidationError
+from ninja.errors import ValidationError
+from ninja.responses import Response
+from pydantic.error_wrappers import ValidationError as PydanticValidationError
 
 from ddpui import auth
 from ddpui.ddpprefect.schema import OrgDbtSchema
 from ddpui.models.org_user import OrgUserResponse
 from ddpui.utils.helpers import runcmd
+from ddpui.utils.dbtdocs import create_single_html
 from ddpui.celeryworkers.tasks import setup_dbtworkspace
-from ddpui.ddpprefect import prefect_service
-from ddpui.ddpprefect import DBTCORE
 from ddpui.ddpdbt import dbt_service
 
 dbtapi = NinjaAPI(urls_namespace="dbt")
 
 
-# @dbtapi.exception_handler(ValidationError)
-# def ninja_validation_error_handler(request, exc):  # pylint: disable=unused-argument
-#     """Handle any ninja validation errors raised in the apis"""
-#     return Response({"error": exc.errors}, status=422)
+@dbtapi.exception_handler(ValidationError)
+def ninja_validation_error_handler(request, exc):  # pylint: disable=unused-argument
+    """
+    Handle any ninja validation errors raised in the apis
+    These are raised during request payload validation
+    exc.errors is correct
+    """
+    return Response({"detail": exc.errors}, status=422)
 
 
-# @dbtapi.exception_handler(PydanticValidationError)
-# def pydantic_validation_error_handler(
-#     request, exc: PydanticValidationError
-# ):  # pylint: disable=unused-argument
-#     """Handle any pydantic errors raised in the apis"""
-#     return Response({"error": exc.errors()}, status=422)
+@dbtapi.exception_handler(PydanticValidationError)
+def pydantic_validation_error_handler(
+    request, exc: PydanticValidationError
+):  # pylint: disable=unused-argument
+    """
+    Handle any pydantic errors raised in the apis
+    These are raised during response payload validation
+    exc.errors() is correct
+    """
+    return Response({"detail": exc.errors()}, status=500)
 
 
-# @dbtapi.exception_handler(HttpError)
-# def ninja_http_error_handler(
-#     request, exc: HttpError
-# ):  # pylint: disable=unused-argument
-#     """Handle any http errors raised in the apis"""
-#     return Response({"error": " ".join(exc.args)}, status=exc.status_code)
-
-
-# @dbtapi.exception_handler(Exception)
-# def ninja_default_error_handler(
-#     request, exc: Exception
-# ):  # pylint: disable=unused-argument
-#     """Handle any other exception raised in the apis"""
-#     return Response({"error": " ".join(exc.args)}, status=500)
+@dbtapi.exception_handler(Exception)
+def ninja_default_error_handler(
+    request, exc: Exception
+):  # pylint: disable=unused-argument # skipcq PYL-W0613
+    """Handle any other exception raised in the apis"""
+    return Response({"detail": "something went wrong"}, status=500)
 
 
 @dbtapi.post("/workspace/", auth=auth.CanManagePipelines())
@@ -110,3 +111,33 @@ def post_dbt_git_pull(request):
         ) from error
 
     return {"success": True}
+
+
+@dbtapi.post("/makedocs/", auth=auth.CanManagePipelines())
+def post_dbt_makedocs(request):
+    """prepare the dbt docs single html"""
+    orguser = request.orguser
+    if orguser.org.dbt is None:
+        raise HttpError(400, "dbt is not configured for this client")
+
+    project_dir = Path(os.getenv("CLIENTDBT_ROOT")) / orguser.org.slug
+    if not os.path.exists(project_dir):
+        raise HttpError(400, "create the dbt env first")
+
+    repo_dir = project_dir / "dbtrepo"
+    if not os.path.exists(repo_dir / "target"):
+        raise HttpError(400, "run dbt docs generate first")
+
+    html = create_single_html(repo_dir)
+    htmlfilename = str(repo_dir / "dbtdocs.html")
+    with open(htmlfilename, "w", encoding="utf-8") as indexfile:
+        indexfile.write(html)
+        indexfile.close()
+
+    redis = Redis()
+    token = uuid4()
+    redis_key = f"dbtdocs-{token.hex}"
+    redis.set(redis_key, htmlfilename.encode("utf-8"))
+    redis.expire(redis_key, 3600 * 24)
+
+    return {"token": token.hex}
